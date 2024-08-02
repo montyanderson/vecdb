@@ -58,3 +58,12 @@ Search.
 ```
 
 More instructions coming soon.
+
+## todo
+
+* [x] basic functionality
+* [x] arm neon simd
+* [ ] x86 simd
+* [ ] benchmark
+* [ ] pretty output
+* [ ] n-ranked search results
