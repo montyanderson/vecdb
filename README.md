@@ -2,6 +2,8 @@
 
 > Toy vector database written in c99.
 
+https://github.com/user-attachments/assets/879b5d35-d237-466a-a9fa-d24b170a4a5b
+
 ## features
 
 * 🚀 Fast
