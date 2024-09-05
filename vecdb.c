@@ -8,8 +8,12 @@
 #include <stdint.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <math.h> // doesn't need linking
+#include <time.h>
 
 #include "json.h"
+
+const char *vecdb = "[\033[1m\x1b[31mv\x1b[32me\x1b[33mc\x1b[34md\x1b[35mb\x1b[0m]";
 
 typedef float number_t;
 typedef number_t* vector_t;
@@ -133,7 +137,7 @@ database_t io_map_database(state_t *state) {
 }
 
 // get a pointer to the beginning of a chunk – the vector
-inline vector_t database_get_chunk(
+static inline vector_t database_get_chunk(
     state_t *state,
     database_t *database,
     size_t i
@@ -145,7 +149,7 @@ inline vector_t database_get_chunk(
 }
 
 // get a pointer to the second part of a chunk – the label
-inline vector_t database_get_chunk_label(
+static inline vector_t database_get_chunk_label(
     state_t *state,
     database_t *database,
     size_t i
@@ -157,7 +161,7 @@ inline vector_t database_get_chunk_label(
     );
 }
 
-/* calculations */
+/* non-simd get_distance() */
 
 float get_distance_basic(size_t dimensions, float *a, float *b) {
     float sum = 0.0;
@@ -169,13 +173,15 @@ float get_distance_basic(size_t dimensions, float *a, float *b) {
     return __builtin_sqrtf(sum);
 }
 
-#define VECDB_SIMD 0
+#define VECDB_SIMD "generic"
 #define get_distance get_distance_basic
+
+/* arm neon 128-bit get_distance() */
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 
-float get_distance_arm_simd(size_t dimensions, float *a, float *b) {
+float get_distance_arm_128(size_t dimensions, float *a, float *b) {
     assert(dimensions % 4 == 0);
 
     float sum = 0.0;
@@ -200,10 +206,52 @@ float get_distance_arm_simd(size_t dimensions, float *a, float *b) {
     return  __builtin_sqrtf(sum);
 }
 
-#define get_distance get_distance_arm_simd
-#define VECDB_SIMD 1
+#define get_distance get_distance_arm_128
+#define VECDB_SIMD "neon-128"
 #endif
 
+/* x86 avr 256-bit get_distance() */
+
+#ifdef __AVX__
+#include <immintrin.h>
+
+static inline float get_distance_avx_256(size_t dimensions, float *a, float *b) {
+    assert(dimensions % 8 == 0);  // AVX processes 8 floats at a time
+
+    __m256 sum_vec = _mm256_setzero_ps();  // Initialize sum vector to zero
+
+    for (size_t i = 0; i < dimensions; i += 8) {
+        __m256 va = _mm256_loadu_ps(&a[i]);  // Load 8 floats from array a
+        __m256 vb = _mm256_loadu_ps(&b[i]);  // Load 8 floats from array b
+
+        // vc = va - vb
+        __m256 vc = _mm256_sub_ps(va, vb);
+
+        // vc = vc * vc
+        vc = _mm256_mul_ps(vc, vc);
+
+        // Accumulate the sum of squares
+        sum_vec = _mm256_add_ps(sum_vec, vc);
+    }
+
+    // Sum the elements of sum_vec
+    __m128 vlow  = _mm256_castps256_ps128(sum_vec);
+    __m128 vhigh = _mm256_extractf128_ps(sum_vec, 1);
+    vlow  = _mm_add_ps(vlow, vhigh);
+
+    __m128 sum128 = _mm_hadd_ps(vlow, vlow);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+
+    float sum = _mm_cvtss_f32(sum128);
+
+    return sqrtf(sum);
+}
+
+#undef get_distance
+#define get_distance get_distance_avx_256
+#undef VECDB_SIMD
+#define VECDB_SIMD "avx-256"
+#endif
 
 /* commands */
 
@@ -240,6 +288,65 @@ struct search_result_s {
     char *label;
 };
 
+/*
+inline void search_insert_contender(
+	struct search_result_s *results,
+	size_t results_length,
+	struct search_result_s *contender
+) {
+	if (contender->distance < results[results_length - 1].distance) {
+       // replace the worst result with the new result
+       results[results_length - 1] = *contender;
+
+       // Sort the results array to keep the lowest distances in order
+       for (
+       	size_t j = results_length - 1;
+       	j > 0 && results[j].distance < results[j - 1].distance;
+       	j--
+       ) {
+           // Swap the results
+           struct search_result_s temp = results[j];
+           results[j] = results[j - 1];
+           results[j - 1] = temp;
+       }
+   }
+}
+*/
+
+static inline void search_insert_contender(
+    struct search_result_s *results,
+    size_t results_length,
+    struct search_result_s *contender
+) {
+    // Only proceed if the contender is better than the worst result
+    if (contender->distance < results[results_length - 1].distance) {
+        // Perform a binary search to find the correct position for the new contender
+        size_t low = 0;
+        size_t high = results_length - 1;
+
+        while (low < high) {
+            size_t mid = (low + high) / 2;
+            if (results[mid].distance > contender->distance) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        // Shift elements to the right to make room for the new contender
+        for (size_t j = results_length - 1; j > low; j--) {
+            results[j] = results[j - 1];
+        }
+
+        // Insert the new contender at the found position
+        results[low] = *contender;
+    }
+}
+
+#ifdef VECDB_USE_OPENMP
+#include <omp.h>
+#endif
+
 void command_search(state_t *state, int argc, char*argv[]) {
     io_read_stdin(state);
         // read stdin into state->io_buffer
@@ -249,27 +356,95 @@ void command_search(state_t *state, int argc, char*argv[]) {
     
     database_t db = io_map_database(state);
 
-    const size_t results_length = 10;
-    struct search_result_s results[results_length];
+    const size_t results_length = 20;
+    struct search_result_s global_results[results_length];
 
-    for(size_t i = 0; i < db.length; i++) {
-        // copy vector from database into the aligned space for comparison
-        memcpy(
-            state->hot_vector,
-            database_get_chunk(state, &db, i),
-            get_vector_size(state)
-        );
-
-        number_t distance = get_distance(
-            state->dimensions,
-            state->input_vector,
-            state->hot_vector
-        );
-        
-        char *label = database_get_chunk_label(state, &db, i);
-
-        printf("%s\n\t%f\n", label, distance);
+    // initialise results to infinity
+    for(size_t i = 0; i < results_length; i++) {
+        global_results[i].distance = INFINITY;
     }
+
+	int start_time = clock();
+
+	#ifdef VECDB_USE_OPENMP
+	omp_set_num_threads(8);
+
+	#pragma omp parallel
+	#endif
+	{
+		// database_t db = io_map_database(state);
+
+		#ifdef VECDB_USE_OPENMP
+		int total_threads = omp_get_num_threads();
+		int thread_id = omp_get_thread_num();
+		#else
+		int total_threads = 1;
+		int thread_id = 1;
+		#endif
+
+		struct search_result_s local_results[results_length];
+
+		// initialise results to infinity
+	    for(size_t i = 0; i < results_length; i++) {
+	        local_results[i].distance = INFINITY;
+	    }
+
+		for(size_t i = thread_id; i < db.length; i += total_threads) {
+			number_t hot_vector[state->dimensions];
+	    
+	        // copy vector from database into the aligned space for comparison
+	        memcpy(
+	            hot_vector,
+	            database_get_chunk(state, &db, i),
+	            get_vector_size(state)
+	        );
+
+	        
+			struct search_result_s contender;
+			
+			contender.distance = get_distance(
+	            state->dimensions,
+	            state->input_vector,
+	            hot_vector
+	        );
+
+	        contender.label = database_get_chunk_label(state, &db, i);
+
+			search_insert_contender(
+				local_results,
+				results_length,
+				&contender
+			);
+
+			if(i % 10000 == 0) {
+				double cpu_time_used = ((double) (clock() - start_time)) / CLOCKS_PER_SEC;
+
+				double mbs = ((i * get_vector_size(state)) / 1e+6) / cpu_time_used;
+				
+				fprintf(stderr, "\r%s searching at \033[4m%.2f\033[0m MB/s", vecdb, mbs);
+			}
+	    }
+
+
+		#ifdef VECDB_USE_OPENMP
+	    #pragma omp critical
+	    #endif
+		{
+			for(size_t i = 0; i < results_length; i++) {
+				search_insert_contender(
+					global_results,
+					results_length,
+					&local_results[i]
+				);
+			}
+		}
+    }
+
+	for(size_t i = 0; i < results_length; i++) {
+		if(global_results[i].label != NULL) {
+			printf("%s\n", global_results[i].label);
+		}
+	}
 }
 
 int main(int argc, char *argv[]) {
@@ -292,11 +467,11 @@ int main(int argc, char *argv[]) {
     state.label_size = strtoul(label_size_string, 0, 10);
     assert(state.label_size > 0 && state.label_size < UINT32_MAX);
 
-    fprintf(stderr, "[vecdb] float type = fp%d\n", sizeof(number_t) * 8);
-    fprintf(stderr, "[vecdb] simd? = %s\n", VECDB_SIMD ? "true" : "false");
-    fprintf(stderr, "[vecdb] state.path = '%s'\n", state.path);
-    fprintf(stderr, "[vecdb] state.dimensions = '%d'\n", state.dimensions);
-    fprintf(stderr, "[vecdb] state.label_size = '%d'\n", state.label_size);
+    fprintf(stderr, "%s float type = fp%d\n", vecdb, sizeof(number_t) * 8);
+    fprintf(stderr, "%s simd = %s\n", vecdb, VECDB_SIMD);
+    fprintf(stderr, "%s state.path = '%s'\n", vecdb, state.path);
+    fprintf(stderr, "%s state.dimensions = '%d'\n", vecdb, state.dimensions);
+    fprintf(stderr, "%s state.label_size = '%d'\n", vecdb, state.label_size);
     fprintf(stderr, "\n");
 
     size_t total_allocation =
